@@ -1,4 +1,4 @@
-﻿albucore==0.0.24
+albucore==0.0.24
 albumentations==2.0.8
 annotated-types==0.8.0
 certifi==2026.10.23
@@ -37,7 +37,7 @@ nvidia-ml-py==13.615.71
 nvidia-nvjitlink-cu12==12.9.86
 onnx==1.17.0
 onnxruntime-gpu==1.21.1
-opencv-python==4.11.0.86
+opencv-python==5.0.0.93
 opencv-python-headless==4.11.0.86
 packaging==26.3
 pillow==12.3.0
