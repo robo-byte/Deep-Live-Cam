@@ -31,6 +31,13 @@ if sys.platform == "win32":
             except (OSError, AttributeError):
                 pass
 
+    try:
+        import onnxruntime as _ort
+        _ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory="")
+        _ort.set_default_logger_severity(3)
+    except Exception:
+        pass
+
     # On Windows, register OpenVINO DLL directories so onnxruntime's
     # OpenVINOExecutionProvider can find openvino.dll.  This must happen
     # before any ONNX InferenceSession is created.  Failure is non-fatal:

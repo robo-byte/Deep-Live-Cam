@@ -12,6 +12,16 @@
   <img src="media/demo.gif" alt="Demo GIF" width="800">
 </p>
 
+> ### 👗 NEW: Real-Time Virtual Clothes Try-On & 3-Mode Pipeline (GTX 1050 Ti Edition)
+> This project now includes **Real-Time Virtual Clothes Try-On** with **3 Live Pipeline Modes**:
+> 1. **FACE SWAP** (CUDA InsightFace face swap, original feature)
+> 2. **CLOTHES TRY-ON** (MediaPipe Pose + SelfieSegmentation on CPU, 43–60 FPS, keeps your real face)
+> 3. **BOTH** (Face Swap + Virtual Clothes Try-On simultaneously)
+>
+> All modes stream directly to the **`Face Swap Cam`** virtual camera for WhatsApp, Chrome, Zoom, and Meet!  
+> 📖 **Full Guide & Documentation:** [**README_TRYON.md**](README_TRYON.md) | [**README_FACESWAP.md**](README_FACESWAP.md)  
+> 🚀 **Quick Start:** Double-click [`start_browser_ui.bat`](start_browser_ui.bat) for Web Studio (`http://localhost:7860`) or [`start_clothes_tryon.bat`](start_clothes_tryon.bat)
+
 ##  Disclaimer
 
 This deepfake software is designed to be a productive tool for the AI-generated media industry. It can assist artists in animating custom characters, creating engaging content, and even using models for clothing design.

@@ -1,0 +1,11 @@
+{
+  "name": "Navy T-Shirt (Fitted)",
+  "garment_path": "garments\\classic_navy_tshirt.png",
+  "category": "t-shirt",
+  "scale": 1.0,
+  "width_scale": 1.0,
+  "length_scale": 1.0,
+  "offset_x": 0.0,
+  "offset_y": 0.0,
+  "opacity": 1.0
+}

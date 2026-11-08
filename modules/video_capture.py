@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import time
@@ -5,7 +6,6 @@ from typing import Optional, Tuple, Callable
 import platform
 import threading
 
-# Only import Windows-specific library if on Windows
 if platform.system() == "Windows":
     from pygrabber.dshow_graph import FilterGraph
 
@@ -18,45 +18,53 @@ class VideoCapturer:
         self._frame_ready = threading.Event()
         self.is_running = False
         self.cap = None
+        self._is_demo_video = (device_index < 0)
+        self._target_size: Optional[Tuple[int, int]] = None
+        self._last_read_time: float = 0.0
         # Actual values reported by the camera after configuration
         self.actual_width: int = 0
         self.actual_height: int = 0
         self.actual_fps: float = 0.0
 
         # Initialize Windows-specific components if on Windows
-        if platform.system() == "Windows":
+        if platform.system() == "Windows" and not self._is_demo_video:
             self.graph = FilterGraph()
-            # Verify device exists
             devices = self.graph.get_input_devices()
             if self.device_index >= len(devices):
-                raise ValueError(
-                    f"Invalid device index {device_index}. Available devices: {len(devices)}"
+                # Fall back to demo video if physical device is unplugged
+                print(
+                    f"[VideoCapturer] Device index {device_index} not connected "
+                    f"(found {len(devices)} devices). Falling back to Demo Camera video."
                 )
+                self._is_demo_video = True
 
-    def start(self, width: int = 960, height: int = 540, fps: int = 60) -> bool:
+    def start(self, width: int = 640, height: int = 480, fps: int = 30) -> bool:
         """Initialize and start video capture"""
         try:
+            self._target_size = (width, height)
+            if self._is_demo_video:
+                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                media_name = (
+                    "test_webcam_480x360.mp4" if width <= 480 else "test_webcam_640x480.mp4"
+                )
+                video_path = os.path.join(root_dir, "media", media_name)
+                if not os.path.exists(video_path):
+                    video_path = os.path.join(root_dir, "media", "ludwig.gif")
+                self.cap = cv2.VideoCapture(video_path)
+                if not self.cap or not self.cap.isOpened():
+                    raise RuntimeError(f"Failed to open demo video: {video_path}")
+                self.actual_width = width
+                self.actual_height = height
+                self.actual_fps = float(fps or 30.0)
+                print(
+                    f"[VideoCapturer] Demo Camera ({os.path.basename(video_path)}) "
+                    f"{self.actual_width}x{self.actual_height} @ {self.actual_fps:.1f}fps",
+                    flush=True,
+                )
+                self.is_running = True
+                return True
+
             if platform.system() == "Windows":
-                # device_index comes from pygrabber.FilterGraph (DirectShow
-                # enumeration), so open with DSHOW first to preserve mapping.
-                # MSMF and DirectShow enumerate cameras in different orders, so
-                # opening MSMF with a DSHOW index silently selects the wrong
-                # camera. MSMF/ANY remain as fallbacks for cameras DSHOW can't
-                # open.
-                #
-                # Pass codec + resolution + fps as construction params (OpenCV
-                # 4.6+). DSHOW locks the pixel format at open time and ignores
-                # later cap.set(CAP_PROP_FOURCC, ...) — without this, DSHOW
-                # falls back to uncompressed YUYV at 1080p, which is USB-
-                # bandwidth-limited to ~5 fps. Setting MJPG at construction
-                # negotiates compressed frames from the first read.
-                mjpg = cv2.VideoWriter_fourcc(*'MJPG')
-                open_params = [
-                    cv2.CAP_PROP_FOURCC, mjpg,
-                    cv2.CAP_PROP_FRAME_WIDTH, width,
-                    cv2.CAP_PROP_FRAME_HEIGHT, height,
-                    cv2.CAP_PROP_FPS, fps,
-                ]
                 capture_methods = [
                     (self.device_index, cv2.CAP_DSHOW),
                     (self.device_index, cv2.CAP_MSMF),
@@ -65,7 +73,7 @@ class VideoCapturer:
 
                 for dev_id, backend in capture_methods:
                     try:
-                        self.cap = cv2.VideoCapture(dev_id, backend, open_params)
+                        self.cap = cv2.VideoCapture(dev_id, backend)
                         if self.cap.isOpened():
                             break
                         self.cap.release()
@@ -79,24 +87,16 @@ class VideoCapturer:
             if not self.cap or not self.cap.isOpened():
                 raise RuntimeError("Failed to open camera")
 
-            # Belt-and-braces: also set via cap.set() for backends that honor
-            # post-open changes (MSMF, V4L2). DSHOW ignores these, but the
-            # construction params above already handled it.
-            if platform.system() != "Windows":
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                self.cap.set(cv2.CAP_PROP_FPS, fps)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self.cap.set(cv2.CAP_PROP_FPS, fps)
 
-            # Read back resolution (usually reliable)
             self.actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            # CAP_PROP_FPS is unreliable on DirectShow — often reports 30
-            # even when the camera delivers 60.  Measure empirically by
-            # timing a burst of frames.
             reported_fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.actual_fps = self._measure_fps(warmup=10, sample=30,
+            self.actual_fps = self._measure_fps(warmup=3, sample=8,
                                                 fallback=reported_fps or fps)
 
             print(f"[VideoCapturer] {self.actual_width}x{self.actual_height} "
@@ -117,8 +117,27 @@ class VideoCapturer:
         if not self.is_running or self.cap is None:
             return False, None
 
+        if self._is_demo_video and self.actual_fps > 0:
+            now = time.perf_counter()
+            frame_period = 1.0 / self.actual_fps
+            dt = now - self._last_read_time
+            if dt < frame_period:
+                time.sleep(max(0.0, frame_period - dt))
+            self._last_read_time = time.perf_counter()
+
         ret, frame = self.cap.read()
-        if ret:
+        if not ret and self._is_demo_video:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap.read()
+
+        if ret and frame is not None:
+            if (
+                self._target_size is not None
+                and (frame.shape[1], frame.shape[0]) != self._target_size
+            ):
+                frame = cv2.resize(
+                    frame, self._target_size, interpolation=cv2.INTER_AREA
+                )
             self._current_frame = frame
             if self.frame_callback:
                 self.frame_callback(frame)
@@ -134,12 +153,7 @@ class VideoCapturer:
 
     def _measure_fps(self, warmup: int = 10, sample: int = 30,
                      fallback: float = 30.0) -> float:
-        """Read warmup+sample frames and return measured FPS.
-
-        This is more reliable than CAP_PROP_FPS which often lies on
-        DirectShow.  Takes ~0.5-1s at startup but gives a ground-truth
-        number for adaptive polling/detection intervals.
-        """
+        """Read warmup+sample frames and return measured FPS."""
         try:
             for _ in range(warmup):
                 self.cap.read()

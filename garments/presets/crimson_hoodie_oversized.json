@@ -1,0 +1,11 @@
+{
+  "name": "Crimson Hoodie (Oversized)",
+  "garment_path": "garments\\crimson_street_hoodie.png",
+  "category": "hoodie",
+  "scale": 1.06,
+  "width_scale": 1.04,
+  "length_scale": 1.04,
+  "offset_x": 0.0,
+  "offset_y": 0.0,
+  "opacity": 1.0
+}

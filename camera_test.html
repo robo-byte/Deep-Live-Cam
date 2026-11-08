@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Face Swap Cam - WebRTC Camera Test (WhatsApp Web Simulator)</title>
+  <style>
+    body {
+      background: #121212;
+      color: #eaeaea;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .card {
+      background: #1e1e1e;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 20px;
+      max-width: 760px;
+      width: 100%;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    h1 { margin-top: 0; font-size: 1.4rem; color: #7cb3ff; }
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    select, button {
+      background: #2b2b2b;
+      color: #fff;
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 0.95rem;
+    }
+    button {
+      background: #2d6cdf;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #3b7cf5; }
+    video {
+      width: 100%;
+      max-height: 480px;
+      background: #000;
+      border-radius: 8px;
+      border: 1px solid #333;
+    }
+    .status {
+      margin-top: 12px;
+      font-size: 0.9rem;
+      color: #9ec5ff;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Face Swap Cam — Local WebRTC Verification Page</h1>
+    <div class="controls">
+      <label for="camSelect">Camera:</label>
+      <select id="camSelect"></select>
+      <button id="btnStart">Start Stream</button>
+    </div>
+    <video id="videoEl" autoplay playsinline muted></video>
+    <div class="status" id="statusEl">Click "Start Stream" and allow camera access to test Face Swap Cam.</div>
+  </div>
+  <script>
+    const camSelect = document.getElementById('camSelect');
+    const videoEl = document.getElementById('videoEl');
+    const statusEl = document.getElementById('statusEl');
+    let currentStream = null;
+
+    async function listCameras() {
+      try {
+        const temp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        temp.getTracks().forEach(t => t.stop());
+      } catch (e) {}
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter(d => d.kind === 'videoinput');
+      camSelect.innerHTML = '';
+      let faceSwapIdx = 0;
+      cams.forEach((c, idx) => {
+        const opt = document.createElement('option');
+        opt.value = c.deviceId;
+        opt.textContent = c.label || `Camera ${idx + 1}`;
+        if ((c.label || '').toLowerCase().includes('face swap cam')) {
+          faceSwapIdx = idx;
+        }
+        camSelect.appendChild(opt);
+      });
+      if (cams.length > 0) {
+        camSelect.selectedIndex = faceSwapIdx;
+      }
+    }
+
+    async function startCamera() {
+      if (currentStream) {
+        currentStream.getTracks().forEach(t => t.stop());
+      }
+      const deviceId = camSelect.value;
+      const constraints = {
+        video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } } : true,
+        audio: false
+      };
+      try {
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        videoEl.srcObject = currentStream;
+        const track = currentStream.getVideoTracks()[0];
+        const settings = track.getSettings();
+        statusEl.textContent = `Connected: "${track.label}" (${settings.width}x${settings.height} @ ${settings.frameRate || 30} FPS)`;
+      } catch (err) {
+        statusEl.textContent = `Error: ${err.message}`;
+      }
+    }
+
+    document.getElementById('btnStart').addEventListener('click', startCamera);
+    camSelect.addEventListener('change', startCamera);
+    listCameras().then(startCamera);
+  </script>
+</body>
+</html>

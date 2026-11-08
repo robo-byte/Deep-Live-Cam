@@ -22,14 +22,15 @@ def _current_det_size() -> tuple:
 
 
 def reset_face_analyser() -> None:
-    """Force re-init on next get_face_analyser() call.
-
-    Called when det_size changes — insightface FaceAnalysis fixes its
-    detection input shape at prepare() time, so a new size requires a
-    fresh prepare() call.
-    """
+    """Update det_size in-place on existing FaceAnalysis if possible to avoid VRAM re-allocation."""
     global FACE_ANALYSER
     with FACE_ANALYSER_LOCK:
+        if FACE_ANALYSER is not None and hasattr(FACE_ANALYSER, "det_model"):
+            try:
+                FACE_ANALYSER.det_model.input_size = _current_det_size()
+                return
+            except Exception:
+                pass
         FACE_ANALYSER = None
 
 

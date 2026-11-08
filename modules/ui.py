@@ -74,8 +74,16 @@ from modules.utilities import (
     is_image,
     is_video,
 )
-from modules import imread_unicode
+from modules import imread_unicode, imwrite_unicode
 from modules.video_capture import VideoCapturer
+from modules.clothes_tryon import (
+    get_tryon_engine,
+    GARMENTS_DIR,
+    GARMENTS_PRESETS_DIR,
+    SCREENSHOTS_DIR,
+    GARMENT_CATEGORIES,
+    ANCHOR_NAMES,
+)
 
 if platform.system() == "Windows":
     from pygrabber.dshow_graph import FilterGraph
@@ -85,8 +93,9 @@ import json
 
 # ─── constants ────────────────────────────────────────────────────────────
 
-ROOT_HEIGHT = 820
-ROOT_WIDTH = 640
+ROOT_HEIGHT = 960
+ROOT_WIDTH = 680
+_LAST_LIVE_FRAME: Optional[np.ndarray] = None
 
 PREVIEW_MAX_HEIGHT = 700
 PREVIEW_MAX_WIDTH = 1200
@@ -430,15 +439,24 @@ def check_and_ignore_nsfw(target, destroy: Optional[Callable] = None) -> bool:
 
 def get_available_cameras() -> Tuple[List[int], List[str]]:
     if platform.system() == "Windows":
+        indices: List[int] = []
+        names: List[str] = []
         try:
             graph = FilterGraph()
             devices = graph.get_input_devices()
-            if devices:
-                return list(range(len(devices))), devices
-            return [], ["No cameras found"]
+            for idx, name in enumerate(devices):
+                # Exclude our own output virtual camera to avoid a feedback loop
+                if "face swap cam" in name.lower() or "unity video capture" in name.lower():
+                    continue
+                indices.append(idx)
+                names.append(name)
         except Exception as exc:
             print(f"Error detecting cameras: {exc}")
-            return [], ["No cameras found"]
+        # Always provide the built-in Demo Camera fallback so Live + Virtual Cam
+        # can be tested even when no physical USB camera is plugged in.
+        indices.append(-1)
+        names.append("Demo Camera (Built-in Test Video)")
+        return indices, names
 
     if platform.system() == "Darwin":
         return [0, 1], ["Camera 0", "Camera 1"]
@@ -494,7 +512,18 @@ class _Switch(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, start_cb: Callable, destroy_cb: Callable):
         super().__init__()
+        cli_res = modules.globals.capture_resolution
+        cli_det = modules.globals.det_size
+        cli_skip = getattr(modules.globals, "frame_skip", 2)
+        cli_prof = getattr(modules.globals, "profile", "balanced")
+        cli_vcam = getattr(modules.globals, "virtual_cam", True)
         load_switch_states()
+        # Preserve CLI/profile settings over stale switch_states.json
+        modules.globals.capture_resolution = cli_res
+        modules.globals.det_size = cli_det
+        modules.globals.frame_skip = cli_skip
+        modules.globals.profile = cli_prof
+        modules.globals.virtual_cam = cli_vcam
         self._start_cb = start_cb
         self._destroy_cb = destroy_cb
 
@@ -525,18 +554,41 @@ class MainWindow(QMainWindow):
         # Camera selection
         layout.addWidget(self._build_camera_card())
 
+        # Virtual Clothes Try-On & Mode Selector
+        layout.addWidget(self._build_clothes_tryon_card())
+
         # Status & footer
         self._status_label = QLabel("")
         self._status_label.setObjectName("statusLabel")
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._status_label)
 
-        footer = QLabel("Deep Live Cam")
+        footer = QLabel("Deep Live Cam (GTX 1050 Ti + Face Swap Cam Edition)")
         footer.setObjectName("linkLabel")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         footer.setCursor(Qt.CursorShape.PointingHandCursor)
         footer.mousePressEvent = lambda _e: webbrowser.open("https://deeplivecam.net")
         layout.addWidget(footer)
+
+        # Auto-load CLI source_path or default character face
+        if not modules.globals.source_path:
+            default_face = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "faces",
+                "default_character.jpg",
+            )
+            if os.path.isfile(default_face):
+                modules.globals.source_path = default_face
+        if modules.globals.source_path and os.path.isfile(modules.globals.source_path):
+            try:
+                self.source_label.setPixmap(
+                    render_image_preview(modules.globals.source_path, (200, 200))
+                )
+                self.source_label.setText("")
+            except Exception:
+                pass
+        if getattr(modules.globals, "auto_live", False):
+            QTimer.singleShot(400, self._on_live)
 
     # ── image row ────────────────────────────────────────────────────────
 
@@ -732,10 +784,11 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(6)
 
-        # Row 0: camera selector + Live button
+        # Row 0: camera selector + Refresh + Live button
         grid.addWidget(QLabel(_("Select Camera:")), 0, 0)
         self._camera_indices, self._camera_names = get_available_cameras()
 
+        cam_row = QHBoxLayout()
         self.cb_camera = QComboBox()
         if not self._camera_names or self._camera_names[0] == "No cameras found":
             self.cb_camera.addItem("No cameras found")
@@ -744,23 +797,31 @@ class MainWindow(QMainWindow):
         else:
             self.cb_camera.addItems(self._camera_names)
             cam_ok = True
+            if modules.globals.camera_index is not None and modules.globals.camera_index in self._camera_indices:
+                self.cb_camera.setCurrentIndex(self._camera_indices.index(modules.globals.camera_index))
         self.cb_camera.setToolTip(_("Select which camera to use for live mode"))
-        grid.addWidget(self.cb_camera, 0, 1)
+        cam_row.addWidget(self.cb_camera, 1)
+
+        self.btn_refresh_cam = QPushButton("🔄")
+        self.btn_refresh_cam.setObjectName("secondary")
+        self.btn_refresh_cam.setFixedWidth(38)
+        self.btn_refresh_cam.setToolTip("Refresh connected USB cameras")
+        self.btn_refresh_cam.clicked.connect(self._on_refresh_cameras)
+        cam_row.addWidget(self.btn_refresh_cam)
+        grid.addLayout(cam_row, 0, 1)
 
         self.btn_live = QPushButton(_("Live"))
         self.btn_live.setEnabled(cam_ok)
-        self.btn_live.setToolTip(_("Start real-time face swap using webcam"))
+        self.btn_live.setToolTip(_("Start real-time face swap and stream to Face Swap Cam"))
         self.btn_live.clicked.connect(self._on_live)
         grid.addWidget(self.btn_live, 0, 2)
 
         # Row 1: capture resolution
         grid.addWidget(QLabel(_("Resolution:")), 1, 0)
         self.cb_resolution = QComboBox()
-        # 640x480 is native on virtually every webcam and the safest 30fps
-        # mode on USB 2.0. Higher tiers are 16:9 and useful when the camera
-        # supports them natively (DSLR + capture card, USB 3.0 webcams).
         self._resolution_options = [
-            ("640 x 480", (640, 480)),
+            ("480 x 360 (Fast)", (480, 360)),
+            ("640 x 480 (Balanced)", (640, 480)),
             ("960 x 540 (qHD)", (960, 540)),
             ("1280 x 720 (HD)", (1280, 720)),
             ("1920 x 1080 (FHD)", (1920, 1080)),
@@ -768,23 +829,16 @@ class MainWindow(QMainWindow):
         for label, _wh in self._resolution_options:
             self.cb_resolution.addItem(label)
         cur = tuple(modules.globals.capture_resolution)
-        idx = next((i for i, (_, wh) in enumerate(self._resolution_options) if wh == cur), 0)
+        idx = next((i for i, (_, wh) in enumerate(self._resolution_options) if wh == cur), 1)
         self.cb_resolution.setCurrentIndex(idx)
         self.cb_resolution.currentIndexChanged.connect(self._on_resolution_change)
-        self.cb_resolution.setToolTip(_(
-            "Requested webcam resolution. Camera may negotiate to its "
-            "nearest supported size — actual size printed in console as "
-            "'[VideoCapturer] WxH @ FPS'. Applies on next Live start.\n\n"
-            "640x480 is native on virtually every webcam and the safest "
-            "30fps choice. qHD often works too. HD/FHD typically drop to "
-            "~10fps on USB 2.0 webcams due to isochronous bandwidth limits."
-        ))
+        self.cb_resolution.setToolTip(_("Requested webcam resolution (480x360 or 640x480 recommended for GTX 1050 Ti)."))
         grid.addWidget(self.cb_resolution, 1, 1, 1, 2)
 
         # Row 2: face detection size
         grid.addWidget(QLabel(_("Det size:")), 2, 0)
         self.cb_det_size = QComboBox()
-        self._det_size_options = [160, 320, 640]
+        self._det_size_options = [160, 320, 480, 640]
         for v in self._det_size_options:
             self.cb_det_size.addItem(f"{v} x {v}")
         cur_det = int(getattr(modules.globals, 'det_size', modules.globals.DEFAULT_DET_SIZE))
@@ -804,8 +858,265 @@ class MainWindow(QMainWindow):
         ))
         grid.addWidget(self.cb_det_size, 2, 1, 1, 2)
 
+        # Row 3: GTX 1050 Ti Profile + Virtual Cam switch
+        grid.addWidget(QLabel("GPU Profile:"), 3, 0)
+        self.cb_profile = QComboBox()
+        self._profile_options = [
+            ("Fast (480x360, det 160, skip 3)", "fast"),
+            ("Balanced (640x480, det 320, skip 2)", "balanced"),
+            ("Quality (640x480, det 480, sync)", "quality"),
+        ]
+        for lbl, _pk in self._profile_options:
+            self.cb_profile.addItem(lbl)
+        cur_prof = getattr(modules.globals, "profile", "balanced")
+        p_idx = next((i for i, (_, pk) in enumerate(self._profile_options) if pk == cur_prof), 1)
+        self.cb_profile.setCurrentIndex(p_idx)
+        self.cb_profile.currentIndexChanged.connect(self._on_profile_change)
+        grid.addWidget(self.cb_profile, 3, 1)
+
+        self.sw_vcam = _Switch("Face Swap Cam", getattr(modules.globals, "virtual_cam", True),
+                               "Output swapped video to 'Face Swap Cam' Virtual Camera for WhatsApp/Chrome")
+        self.sw_vcam.toggled.connect(lambda v: setattr(modules.globals, "virtual_cam", v))
+        grid.addWidget(self.sw_vcam, 3, 2)
+
         grid.setColumnStretch(1, 1)
         return card
+
+    # ── clothes try-on & mode selector card ──────────────────────────────
+
+    def _build_clothes_tryon_card(self) -> QGroupBox:
+        card = QGroupBox("Virtual Clothes Try-On & Mode Selector")
+        grid = QGridLayout(card)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        tryon = get_tryon_engine()
+        if getattr(modules.globals, "garment_path", None) and os.path.isfile(modules.globals.garment_path):
+            tryon.set_garment(modules.globals.garment_path)
+
+        # Row 0: Mode selector + Load Garment button + Screenshot button
+        grid.addWidget(QLabel("Live Mode:"), 0, 0)
+        self.cb_tryon_mode = QComboBox()
+        self._tryon_mode_options = [
+            ("1. FACE SWAP (Face Only)", "face_swap"),
+            ("2. CLOTHES TRY-ON (Keep Real Face)", "clothes_tryon"),
+            ("3. BOTH (Face Swap + Clothes Try-On)", "both"),
+        ]
+        for lbl, _mk in self._tryon_mode_options:
+            self.cb_tryon_mode.addItem(lbl)
+        cur_m = getattr(modules.globals, "tryon_mode", "face_swap")
+        m_idx = next((i for i, (_, mk) in enumerate(self._tryon_mode_options) if mk == cur_m), 0)
+        self.cb_tryon_mode.setCurrentIndex(m_idx)
+        self.cb_tryon_mode.currentIndexChanged.connect(self._on_tryon_mode_change)
+        grid.addWidget(self.cb_tryon_mode, 0, 1)
+
+        btn_load_g = QPushButton("Load Garment...")
+        btn_load_g.clicked.connect(self._on_load_garment_file)
+        grid.addWidget(btn_load_g, 0, 2)
+
+        # Row 1: Quick Garment Switcher + Category Dropdown
+        grid.addWidget(QLabel("Garment:"), 1, 0)
+        self.cb_garment_select = QComboBox()
+        self._refresh_garment_combo()
+        self.cb_garment_select.currentIndexChanged.connect(self._on_garment_combo_change)
+        grid.addWidget(self.cb_garment_select, 1, 1)
+
+        self.cb_garment_cat = QComboBox()
+        self.cb_garment_cat.addItems(list(GARMENT_CATEGORIES))
+        self.cb_garment_cat.setCurrentText(tryon.params.category)
+        self.cb_garment_cat.currentTextChanged.connect(self._on_garment_cat_change)
+        grid.addWidget(self.cb_garment_cat, 1, 2)
+
+        # Row 2 & 3: Compact Sliders (Scale, Width, Length, Offset X, Offset Y, Opacity)
+        def _mk_slider(min_i, max_i, val_i, cb):
+            s = QSlider(Qt.Orientation.Horizontal)
+            s.setRange(min_i, max_i)
+            s.setValue(val_i)
+            s.valueChanged.connect(cb)
+            return s
+
+        s_grid = QGridLayout()
+        s_grid.setHorizontalSpacing(8)
+        s_grid.setVerticalSpacing(4)
+        s_grid.addWidget(QLabel("Scale:"), 0, 0)
+        self.sl_g_scale = _mk_slider(65, 145, 100, lambda v: tryon.update_params({"scale": v / 100.0}))
+        s_grid.addWidget(self.sl_g_scale, 0, 1)
+
+        s_grid.addWidget(QLabel("Width:"), 0, 2)
+        self.sl_g_width = _mk_slider(65, 145, 100, lambda v: tryon.update_params({"width_scale": v / 100.0}))
+        s_grid.addWidget(self.sl_g_width, 0, 3)
+
+        s_grid.addWidget(QLabel("Length:"), 0, 4)
+        self.sl_g_length = _mk_slider(65, 145, 100, lambda v: tryon.update_params({"length_scale": v / 100.0}))
+        s_grid.addWidget(self.sl_g_length, 0, 5)
+
+        s_grid.addWidget(QLabel("Off X:"), 1, 0)
+        self.sl_g_ox = _mk_slider(-100, 100, 0, lambda v: tryon.update_params({"offset_x": float(v)}))
+        s_grid.addWidget(self.sl_g_ox, 1, 1)
+
+        s_grid.addWidget(QLabel("Off Y:"), 1, 2)
+        self.sl_g_oy = _mk_slider(-100, 100, 0, lambda v: tryon.update_params({"offset_y": float(v)}))
+        s_grid.addWidget(self.sl_g_oy, 1, 3)
+
+        s_grid.addWidget(QLabel("Opacity:"), 1, 4)
+        self.sl_g_op = _mk_slider(0, 100, 100, lambda v: tryon.update_params({"opacity": v / 100.0}))
+        s_grid.addWidget(self.sl_g_op, 1, 5)
+
+        grid.addLayout(s_grid, 2, 0, 1, 3)
+
+        # Row 4: Calibrate Anchors, Save/Load Preset, Save Screenshot, Skeleton Toggle
+        btn_row = QHBoxLayout()
+        btn_calib = QPushButton("Calibrate Anchors")
+        btn_calib.setObjectName("secondary")
+        btn_calib.clicked.connect(self._on_calibrate_anchors)
+        btn_row.addWidget(btn_calib)
+
+        btn_save_p = QPushButton("Save Preset")
+        btn_save_p.setObjectName("secondary")
+        btn_save_p.clicked.connect(self._on_save_garment_preset)
+        btn_row.addWidget(btn_save_p)
+
+        btn_load_p = QPushButton("Load Preset")
+        btn_load_p.setObjectName("secondary")
+        btn_load_p.clicked.connect(self._on_load_garment_preset)
+        btn_row.addWidget(btn_load_p)
+
+        btn_shot = QPushButton("Save Screenshot")
+        btn_shot.setObjectName("secondary")
+        btn_shot.clicked.connect(self._on_save_screenshot)
+        btn_row.addWidget(btn_shot)
+
+        chk_skel = QCheckBox("Skeleton")
+        chk_skel.toggled.connect(lambda v: tryon.update_params({"show_skeleton": v}))
+        btn_row.addWidget(chk_skel)
+
+        grid.addLayout(btn_row, 3, 0, 1, 3)
+        grid.setColumnStretch(1, 1)
+        return card
+
+    def _refresh_garment_combo(self) -> None:
+        tryon = get_tryon_engine()
+        self._garment_items = tryon.list_garments()
+        self.cb_garment_select.blockSignals(True)
+        self.cb_garment_select.clear()
+        cur_name = tryon.current_garment.name if tryon.current_garment else ""
+        sel_idx = 0
+        for i, item in enumerate(self._garment_items):
+            self.cb_garment_select.addItem(f"{item['filename']} ({item['category']})")
+            if item["filename"] == cur_name:
+                sel_idx = i
+        self.cb_garment_select.setCurrentIndex(sel_idx)
+        self.cb_garment_select.blockSignals(False)
+
+    def _on_tryon_mode_change(self, idx: int) -> None:
+        if 0 <= idx < len(self._tryon_mode_options):
+            lbl, mk = self._tryon_mode_options[idx]
+            modules.globals.tryon_mode = mk
+            update_status(f"Switched live mode to: {lbl}")
+
+    def _on_garment_combo_change(self, idx: int) -> None:
+        if 0 <= idx < len(getattr(self, "_garment_items", [])):
+            item = self._garment_items[idx]
+            tryon = get_tryon_engine()
+            ok, msg = tryon.set_garment(item["path"], item["category"])
+            self.cb_garment_cat.blockSignals(True)
+            self.cb_garment_cat.setCurrentText(tryon.params.category)
+            self.cb_garment_cat.blockSignals(False)
+            update_status(msg)
+
+    def _on_garment_cat_change(self, cat: str) -> None:
+        if cat in GARMENT_CATEGORIES:
+            get_tryon_engine().update_params({"category": cat})
+            update_status(f"Garment category set to: {cat}")
+
+    def _on_load_garment_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Garment Image (PNG/JPG/WEBP)", GARMENTS_DIR, _IMAGE_FILE_FILTER
+        )
+        if path and os.path.isfile(path):
+            import shutil
+            filename = os.path.basename(path)
+            dest_path = os.path.join(GARMENTS_DIR, filename)
+            if os.path.abspath(path) != os.path.abspath(dest_path) and not os.path.exists(dest_path):
+                try:
+                    shutil.copy2(path, dest_path)
+                    path = dest_path
+                except Exception:
+                    pass
+            tryon = get_tryon_engine()
+            ok, msg = tryon.set_garment(path, self.cb_garment_cat.currentText())
+            self._refresh_garment_combo()
+            update_status(msg)
+
+    def _on_calibrate_anchors(self) -> None:
+        dlg = GarmentAnchorCalibrationDialog(self)
+        dlg.exec()
+
+    def _on_save_garment_preset(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Garment Preset JSON", GARMENTS_PRESETS_DIR, "JSON Preset (*.json)"
+        )
+        if path:
+            name = os.path.splitext(os.path.basename(path))[0]
+            ok, msg = get_tryon_engine().save_preset(name)
+            update_status(msg)
+
+    def _on_load_garment_preset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Garment Preset JSON", GARMENTS_PRESETS_DIR, "JSON Preset (*.json)"
+        )
+        if path and os.path.isfile(path):
+            tryon = get_tryon_engine()
+            ok, msg = tryon.load_preset(os.path.basename(path))
+            p = tryon.params
+            self.cb_garment_cat.setCurrentText(p.category)
+            self.sl_g_scale.setValue(int(round(p.scale * 100)))
+            self.sl_g_width.setValue(int(round(p.width_scale * 100)))
+            self.sl_g_length.setValue(int(round(p.length_scale * 100)))
+            self.sl_g_ox.setValue(int(round(p.offset_x)))
+            self.sl_g_oy.setValue(int(round(p.offset_y)))
+            self.sl_g_op.setValue(int(round(p.opacity * 100)))
+            self._refresh_garment_combo()
+            update_status(msg)
+
+    def _on_save_screenshot(self) -> None:
+        global _LAST_LIVE_FRAME
+        if _LAST_LIVE_FRAME is None:
+            update_status("Start Live preview first to capture a screenshot.")
+            return
+        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fn = f"screenshot_{getattr(modules.globals, 'tryon_mode', 'live')}_{ts}.png"
+        out_path = os.path.join(SCREENSHOTS_DIR, fn)
+        imwrite_unicode(out_path, _LAST_LIVE_FRAME)
+        update_status(f"Saved screenshot: screenshots/{fn}")
+
+    def _on_refresh_cameras(self) -> None:
+        self._camera_indices, self._camera_names = get_available_cameras()
+        self.cb_camera.clear()
+        self.cb_camera.addItems(self._camera_names)
+        self.cb_camera.setEnabled(True)
+        self.btn_live.setEnabled(True)
+        update_status(f"Detected cameras: {', '.join(self._camera_names)}")
+
+    def _on_profile_change(self, idx: int) -> None:
+        if 0 <= idx < len(self._profile_options):
+            _lbl, pk = self._profile_options[idx]
+            modules.globals.apply_profile(pk)
+            reset_face_analyser()
+            # Sync resolution & det_size dropdowns
+            r_idx = next((i for i, (_, wh) in enumerate(self._resolution_options) if wh == tuple(modules.globals.capture_resolution)), 1)
+            self.cb_resolution.blockSignals(True)
+            self.cb_resolution.setCurrentIndex(r_idx)
+            self.cb_resolution.blockSignals(False)
+            if modules.globals.det_size in self._det_size_options:
+                self.cb_det_size.blockSignals(True)
+                self.cb_det_size.setCurrentIndex(self._det_size_options.index(modules.globals.det_size))
+                self.cb_det_size.blockSignals(False)
+            update_status(
+                f"Applied '{pk.upper()}' profile: {modules.globals.capture_resolution[0]}x{modules.globals.capture_resolution[1]}, "
+                f"det_size={modules.globals.det_size}, frame_skip={modules.globals.frame_skip}"
+            )
 
     def _on_resolution_change(self, idx: int) -> None:
         if 0 <= idx < len(self._resolution_options):
@@ -1049,14 +1360,16 @@ class MainWindow(QMainWindow):
             update_status("Source x Target Mapper is already open.")
             _LIVE_MAPPER.raise_()
             return
+        cur_mode = getattr(modules.globals, "tryon_mode", "face_swap")
         if not modules.globals.map_faces:
-            if modules.globals.source_path is None:
+            if cur_mode in ("face_swap", "both") and modules.globals.source_path is None:
                 update_status("Please select a source image first")
                 return
-            from modules.face_analyser import get_face_analyser
-            from modules.processors.frame.face_swapper import get_face_swapper
-            get_face_analyser()
-            get_face_swapper()
+            if cur_mode in ("face_swap", "both"):
+                from modules.face_analyser import get_face_analyser
+                from modules.processors.frame.face_swapper import get_face_swapper
+                get_face_analyser()
+                get_face_swapper()
             _open_webcam_preview(camera_index)
         else:
             modules.globals.source_target_map = []
@@ -1066,6 +1379,127 @@ class MainWindow(QMainWindow):
         # Treat OS-level close as Destroy click
         self._destroy_cb()
         event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        text = event.text().lower()
+        if text == "m":
+            if hasattr(self, "cb_tryon_mode"):
+                cur_idx = self.cb_tryon_mode.currentIndex()
+                next_idx = (cur_idx + 1) % len(self._tryon_mode_options)
+                self.cb_tryon_mode.setCurrentIndex(next_idx)
+                return
+        elif text == "s":
+            self._on_save_screenshot()
+            return
+        elif text in ("1", "2", "3", "4", "5"):
+            idx = int(text) - 1
+            if hasattr(self, "cb_garment_select") and idx < self.cb_garment_select.count():
+                self.cb_garment_select.setCurrentIndex(idx)
+                return
+        elif text == "[":
+            if hasattr(self, "cb_garment_select"):
+                cur = self.cb_garment_select.currentIndex()
+                cnt = self.cb_garment_select.count()
+                if cnt > 0:
+                    self.cb_garment_select.setCurrentIndex((cur - 1 + cnt) % cnt)
+                    return
+        elif text == "]":
+            if hasattr(self, "cb_garment_select"):
+                cur = self.cb_garment_select.currentIndex()
+                cnt = self.cb_garment_select.count()
+                if cnt > 0:
+                    self.cb_garment_select.setCurrentIndex((cur + 1) % cnt)
+                    return
+        super().keyPressEvent(event)
+
+
+class GarmentAnchorCalibrationDialog(QDialog):
+    """Interactive 6-point click-calibration dialog for the Desktop PyQt6 UI."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calibrate 6 Garment Anchors (Click Image to Set Selected Anchor)")
+        self.resize(620, 660)
+        self.tryon = get_tryon_engine()
+        self.garment = self.tryon.current_garment
+        self.anchors = (
+            {k: list(v) for k, v in self.garment.anchors.items()}
+            if self.garment is not None
+            else {}
+        )
+        self.active_idx = 0
+
+        layout = QVBoxLayout(self)
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Select Anchor Point to Place:"))
+        self.cb_anchor = QComboBox()
+        for i, name in enumerate(ANCHOR_NAMES):
+            self.cb_anchor.addItem(f"{i+1}. {name}")
+        self.cb_anchor.currentIndexChanged.connect(self._on_anchor_sel)
+        top_row.addWidget(self.cb_anchor, 1)
+        layout.addLayout(top_row)
+
+        self.canvas_label = QLabel()
+        self.canvas_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.canvas_label.setFixedSize(512, 512)
+        self.canvas_label.mousePressEvent = self._on_canvas_click
+        layout.addWidget(self.canvas_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        btn_row = QHBoxLayout()
+        btn_reset = QPushButton("Reset Auto Anchors")
+        btn_reset.setObjectName("secondary")
+        btn_reset.clicked.connect(self._on_reset)
+        btn_row.addWidget(btn_reset)
+
+        btn_apply = QPushButton("Apply & Save Anchors")
+        btn_apply.clicked.connect(self._on_apply)
+        btn_row.addWidget(btn_apply)
+        layout.addLayout(btn_row)
+        self._redraw()
+
+    def _on_anchor_sel(self, idx: int) -> None:
+        self.active_idx = max(0, min(len(ANCHOR_NAMES) - 1, idx))
+        self._redraw()
+
+    def _on_canvas_click(self, event) -> None:
+        if self.garment is None:
+            return
+        gh, gw = self.garment.shaded_rgba.shape[:2]
+        pos = event.position()
+        gx = float(np.clip(pos.x() * gw / 512.0, 0, gw - 1))
+        gy = float(np.clip(pos.y() * gh / 512.0, 0, gh - 1))
+        key = ANCHOR_NAMES[self.active_idx]
+        self.anchors[key] = [round(gx, 1), round(gy, 1)]
+        self.active_idx = (self.active_idx + 1) % len(ANCHOR_NAMES)
+        self.cb_anchor.setCurrentIndex(self.active_idx)
+        self._redraw()
+
+    def _on_reset(self) -> None:
+        if self.garment is not None:
+            self.anchors = {k: list(v) for k, v in self.garment.auto_anchors.items()}
+            self._redraw()
+
+    def _on_apply(self) -> None:
+        ok, msg = self.tryon.set_custom_anchors(self.anchors)
+        update_status(msg)
+        self.accept()
+
+    def _redraw(self) -> None:
+        if self.garment is None:
+            return
+        rgba = self.garment.shaded_rgba
+        gh, gw = rgba.shape[:2]
+        vis = np.full((gh, gw, 3), 36, dtype=np.uint8)
+        a = (rgba[:, :, 3:4].astype(np.float32) / 255.0)
+        vis = np.clip(vis * (1.0 - a) + rgba[:, :, :3].astype(np.float32) * a, 0, 255).astype(np.uint8)
+        for i, name in enumerate(ANCHOR_NAMES):
+            pt = self.anchors.get(name, [0, 0])
+            col = (0, 255, 0) if i == self.active_idx else (0, 200, 255)
+            p_i = (int(round(pt[0])), int(round(pt[1])))
+            cv2.circle(vis, p_i, 9 if i == self.active_idx else 6, col, -1, cv2.LINE_AA)
+            cv2.putText(vis, f"{i+1}.{name}", (p_i[0] + 8, p_i[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        vis_resized = cv2.resize(vis, (512, 512), interpolation=cv2.INTER_AREA)
+        self.canvas_label.setPixmap(_bgr_to_qpixmap(vis_resized))
 
 
 def _update_tumbler(var: str, value: bool) -> None:
@@ -1166,7 +1600,7 @@ class _CaptureWorker(QThread):
 
 
 class _ProcessingWorker(QThread):
-    """Pulls raw frames, runs detect/swap/enhance, pushes processed frames."""
+    """Pulls raw frames, runs detect/swap/enhance + Virtual Clothes Try-On, pushes processed frames."""
 
     def __init__(self, capture_queue, processed_queue, stop_event, camera_fps: float):
         super().__init__()
@@ -1176,7 +1610,9 @@ class _ProcessingWorker(QThread):
         self._fps = camera_fps
 
     def run(self) -> None:
+        global _LAST_LIVE_FRAME
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+        tryon_engine = get_tryon_engine()
         source_image = None
         last_source_path = None
         reported_source_error = None
@@ -1187,9 +1623,11 @@ class _ProcessingWorker(QThread):
         det_count = 0
         cached_target_face = None
         cached_many_faces = None
-        det_interval = max(1, round(self._fps * 0.08))
+        det_interval = 1 if getattr(modules.globals, "frame_skip", 0) > 0 else max(1, round(self._fps * 0.08))
+        vcam = None
 
-        while not self._stop.is_set():
+        try:
+          while not self._stop.is_set():
             try:
                 frame = self._cq.get(timeout=0.05)
             except queue.Empty:
@@ -1199,21 +1637,17 @@ class _ProcessingWorker(QThread):
             if modules.globals.live_mirror:
                 temp_frame = gpu_flip(temp_frame, 1)
 
-            if not modules.globals.map_faces:
+            cur_mode = getattr(modules.globals, "tryon_mode", "face_swap")
+            run_face_swap = cur_mode in ("face_swap", "both")
+            run_clothes_tryon = cur_mode in ("clothes_tryon", "both")
+
+            if run_face_swap and not modules.globals.map_faces:
                 if (
                     modules.globals.source_path
                     and modules.globals.source_path != last_source_path
                 ):
                     source_frame = imread_unicode(modules.globals.source_path)
                     if source_frame is None:
-                        # Clear the cached path along with the image. It keeps
-                        # a source that is only transiently unreadable (still
-                        # being written, on a volume that just went away) from
-                        # being given up on, and it keeps a bad pick from
-                        # sticking: with the path cached, A -> unreadable B -> A
-                        # never reloaded A, so swapping stayed off. Retrying
-                        # every frame is cheap; the message is reported once per
-                        # path so it cannot flood the status line.
                         source_image = None
                         last_source_path = None
                         if reported_source_error != modules.globals.source_path:
@@ -1241,9 +1675,6 @@ class _ProcessingWorker(QThread):
                 elif cached_target_face is not None:
                     cached_faces = [cached_target_face]
 
-                # Fast detection skips the 2d106 landmark model, but the mouth
-                # mask needs it. Attach landmarks on demand (computed once per
-                # detection cycle — the helper no-ops if already present).
                 if modules.globals.mouth_mask and cached_faces:
                     ensure_landmarks(temp_frame, cached_faces)
 
@@ -1284,7 +1715,7 @@ class _ProcessingWorker(QThread):
                         temp_frame = fp.apply_post_processing(temp_frame, swapped_bboxes)
                     else:
                         temp_frame = fp.process_frame(source_image, temp_frame)
-            else:
+            elif run_face_swap:
                 modules.globals.target_path = None
                 for fp in frame_processors:
                     if fp.NAME == "DLC.FACE-ENHANCER":
@@ -1297,6 +1728,32 @@ class _ProcessingWorker(QThread):
                     else:
                         temp_frame = fp.process_frame_v2(temp_frame)
 
+            if run_clothes_tryon:
+                temp_frame = tryon_engine.process_frame(temp_frame)
+
+            _LAST_LIVE_FRAME = temp_frame
+
+            # Send clean (un-watermarked) frame to Face Swap Cam DirectShow virtual camera
+            if getattr(modules.globals, "virtual_cam", True):
+                try:
+                    fh, fw = temp_frame.shape[:2]
+                    if vcam is None or vcam.width != fw or vcam.height != fh:
+                        if vcam is not None:
+                            vcam.close()
+                        import pyvirtualcam
+                        vcam = pyvirtualcam.Camera(
+                            width=fw,
+                            height=fh,
+                            fps=int(getattr(modules.globals, "capture_fps", 30) or 30),
+                            fmt=pyvirtualcam.PixelFormat.BGR,
+                            backend="unitycapture",
+                        )
+                        print(f"[VirtualCam] Streaming {fw}x{fh} to '{vcam.device}'", flush=True)
+                    vcam.send(temp_frame)
+                except Exception as vcam_err:
+                    if frame_count == 0:
+                        print(f"[VirtualCam] Warning: {vcam_err}", flush=True)
+
             current_time = time.time()
             frame_count += 1
             if current_time - prev_time >= fps_update_interval:
@@ -1304,22 +1761,38 @@ class _ProcessingWorker(QThread):
                 frame_count = 0
                 prev_time = current_time
 
+            preview_frame = temp_frame
             if modules.globals.show_fps:
+                preview_frame = temp_frame.copy()
+                vcam_tag = "VCam:ON" if vcam is not None else "VCam:OFF"
+                prof_tag = getattr(modules.globals, "profile", "balanced").upper()
+                mode_tag = cur_mode.upper()
                 cv2.putText(
-                    temp_frame, f"FPS: {fps:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
+                    preview_frame,
+                    f"FPS: {fps:.1f} | {mode_tag} | {prof_tag} | {vcam_tag}",
+                    (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 0),
+                    2,
                 )
 
             try:
-                self._pq.put_nowait(temp_frame)
+                self._pq.put_nowait(preview_frame)
             except queue.Full:
                 try:
                     self._pq.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    self._pq.put_nowait(temp_frame)
+                    self._pq.put_nowait(preview_frame)
                 except queue.Full:
+                    pass
+        finally:
+            if vcam is not None:
+                try:
+                    vcam.close()
+                except Exception:
                     pass
 
 
@@ -1337,7 +1810,8 @@ class WebcamPreviewWindow(QWidget):
 
         self._cap = VideoCapturer(camera_index)
         req_w, req_h = modules.globals.capture_resolution
-        if not self._cap.start(req_w, req_h, 60):
+        req_fps = int(getattr(modules.globals, "capture_fps", 30) or 30)
+        if not self._cap.start(req_w, req_h, req_fps):
             update_status("Failed to start camera")
             QTimer.singleShot(0, self.close)
             return
@@ -1419,13 +1893,24 @@ class WebcamPreviewWindow(QWidget):
             _WEBCAM_PREVIEW = None
         event.accept()
 
+    def keyPressEvent(self, event) -> None:
+        global _MAIN
+        if _MAIN is not None:
+            _MAIN.keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
+
 
 def _open_webcam_preview(camera_index: int) -> None:
     global _WEBCAM_PREVIEW
     if _WEBCAM_PREVIEW is not None:
         _WEBCAM_PREVIEW.close()
     _WEBCAM_PREVIEW = WebcamPreviewWindow(camera_index)
-    _WEBCAM_PREVIEW.show()
+    if _MAIN is not None:
+        _WEBCAM_PREVIEW.move(max(40, _MAIN.x() + _MAIN.width() + 16), max(40, _MAIN.y()))
+    _WEBCAM_PREVIEW.showNormal()
+    _WEBCAM_PREVIEW.raise_()
+    _WEBCAM_PREVIEW.activateWindow()
 
 
 # ─── mapper dialogs (image/video + live) ────────────────────────────────
@@ -1697,7 +2182,9 @@ class _Window:
         self._main = main_window
 
     def mainloop(self) -> None:
-        self._main.show()
+        self._main.showNormal()
+        self._main.raise_()
+        self._main.activateWindow()
         self._app.exec()
 
 

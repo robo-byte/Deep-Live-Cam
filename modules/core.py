@@ -59,7 +59,15 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
     program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=None)
-    program.add_argument('--det-size', help='face detection input size (160, 320, or 640)', dest='det_size', type=int, default=modules.globals.DEFAULT_DET_SIZE, choices=[160, 320, 640])
+    program.add_argument('--det-size', help='face detection input size (160, 320, 480, or 640)', dest='det_size', type=int, default=None, choices=[160, 320, 480, 640])
+    program.add_argument('--profile', help='GTX 1050 Ti preset profile (fast, balanced, quality)', dest='profile', default='balanced', choices=['fast', 'balanced', 'quality'])
+    program.add_argument('--frame-skip', help='pose-warped intermediate frames per neural swap (0=every frame)', dest='frame_skip', type=int, default=None)
+    program.add_argument('--virtual-cam', help='output live swapped video to Face Swap Cam virtual camera', dest='virtual_cam', action='store_true', default=True)
+    program.add_argument('--no-virtual-cam', help='disable virtual camera output', dest='virtual_cam', action='store_false')
+    program.add_argument('--auto-live', help='automatically start Live webcam face swap on launch', dest='auto_live', action='store_true', default=False)
+    program.add_argument('--camera-index', help='camera index for live mode (-1 for demo video)', dest='camera_index', type=int, default=None)
+    program.add_argument('--mode', help='live pipeline mode: face_swap, clothes_tryon, or both', dest='tryon_mode', default='face_swap', choices=['face_swap', 'clothes_tryon', 'both'])
+    program.add_argument('--garment', help='initial garment image path for clothes try-on', dest='garment_path', default=None)
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
 
     # register deprecated args
@@ -70,11 +78,14 @@ def parse_args() -> None:
 
     args = program.parse_args()
 
+    modules.globals.apply_profile(args.profile)
     modules.globals.source_path = args.source_path
     modules.globals.target_path = args.target_path
     modules.globals.output_path = normalize_output_path(modules.globals.source_path, modules.globals.target_path, args.output_path)
     modules.globals.frame_processors = args.frame_processor
-    modules.globals.headless = args.source_path or args.target_path or args.output_path
+    # Only run batch headless mode when both target and output are specified;
+    # passing -s alone pre-selects the source face in the GUI / live mode.
+    modules.globals.headless = bool(args.target_path and args.output_path)
     modules.globals.keep_fps = args.keep_fps
     modules.globals.keep_audio = args.keep_audio
     modules.globals.keep_frames = args.keep_frames
@@ -89,7 +100,15 @@ def parse_args() -> None:
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
     modules.globals.execution_threads = args.execution_threads
-    modules.globals.det_size = args.det_size
+    if args.det_size is not None:
+        modules.globals.det_size = args.det_size
+    if args.frame_skip is not None:
+        modules.globals.frame_skip = args.frame_skip
+    modules.globals.virtual_cam = args.virtual_cam
+    modules.globals.auto_live = args.auto_live
+    modules.globals.camera_index = args.camera_index
+    modules.globals.tryon_mode = args.tryon_mode
+    modules.globals.garment_path = args.garment_path
     modules.globals.lang = args.lang
 
     # The argparse default (None) avoids evaluating suggest_execution_threads()

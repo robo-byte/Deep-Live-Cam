@@ -238,11 +238,12 @@ def get_face_swapper() -> Any:
             # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
             # memory bandwidth, faster inference.  Fall back to FP32 for
             # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
+            fused_path = os.path.join(models_dir, "inswapper_128_fused.onnx")
             fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
             fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
-            if use_fp16:
-                model_path = fp16_path
+            # Never use FP16 on Pascal (sm_61 / GTX 1050 Ti) where InstanceNorm overflows float16 -> NaN
+            if os.path.exists(fused_path):
+                model_path = fused_path
             elif os.path.exists(fp32_path):
                 model_path = fp32_path
             else:
@@ -287,8 +288,8 @@ def get_face_swapper() -> Any:
                     model_path,
                     providers=providers_config,
                 )
-                # Set up CUDA graph session for faster inference
-                if _HAS_TORCH_CUDA and any(
+                # Set up CUDA graph session for faster inference (works with pure onnxruntime-gpu, no torch needed)
+                if any(
                     p == "CUDAExecutionProvider" or
                     (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
                     for p in providers_config
@@ -395,8 +396,23 @@ def _init_cuda_graph_session(model_path: str, swapper):
     """
     import onnxruntime as ort
     try:
-        providers = [('CUDAExecutionProvider', {'enable_cuda_graph': '1'})]
-        sess = ort.InferenceSession(model_path, providers=providers)
+        # Release the non-graph CUDA session first so we don't hold 2x model weights in 4GB VRAM
+        import gc
+        old_underlying = getattr(swapper, 'session', None)
+        swapper.session = None
+        del old_underlying
+        gc.collect()
+
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        providers = [('CUDAExecutionProvider', {
+            'enable_cuda_graph': '1',
+            'arena_extend_strategy': 'kSameAsRequested',
+            'cudnn_conv_algo_search': 'EXHAUSTIVE',
+            'do_copy_in_default_stream': '1',
+            'cudnn_conv_use_max_workspace': '0',
+        })]
+        sess = ort.InferenceSession(model_path, sess_options=so, providers=providers)
 
         # Pre-allocate GPU buffers with correct shapes
         inp_shape = (1, 3, swapper.input_size[1], swapper.input_size[0])
@@ -426,8 +442,7 @@ def _init_cuda_graph_session(model_path: str, swapper):
         # session attribute, so either works; the adapter survives any
         # later attribute reads on the session and keeps the original
         # session object untouched.
-        if not isinstance(swapper.session, _CudaGraphSessionAdapter):
-            swapper.session = _CudaGraphSessionAdapter(swapper.session)
+        swapper.session = _CudaGraphSessionAdapter(sess)
 
         import sys
         print(f"[{NAME}] CUDA graph session initialized (swap model)")
@@ -546,16 +561,44 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
 
-        # Use paste_back=False and our optimized paste-back
-        if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
-            with modules.globals.dml_lock:
+        # Pose-Warped Frame Skipping for low-VRAM / Pascal GPUs (GTX 1050 Ti):
+        # When frame_skip > 0, run full neural inswapper_128 every (frame_skip + 1)-th frame,
+        # and on intermediate frames warp cached 128x128 bgr_fake onto the current frame's
+        # newly detected 5-point keypoints (target_face.kps) in ~0.05ms + 1.2ms SIMD blend.
+        frame_skip = int(getattr(modules.globals, 'frame_skip', 0) or 0)
+        src_id = id(source_face)
+        _skip_st = getattr(swap_face, '_skip_state', None)
+        if _skip_st is None:
+            _skip_st = {'count': 0, 'bgr_fake': None, 'src_id': None, 'neural_count': 0}
+            setattr(swap_face, '_skip_state', _skip_st)
+        step = _skip_st['count']
+        _skip_st['count'] = step + 1
+
+        can_reuse = (
+            frame_skip > 0
+            and (step % (frame_skip + 1) != 0)
+            and _skip_st['bgr_fake'] is not None
+            and _skip_st['src_id'] == src_id
+            and hasattr(target_face, 'kps')
+            and target_face.kps is not None
+        )
+        if can_reuse:
+            from insightface.utils import face_align
+            M = face_align.estimate_norm(target_face.kps, face_swapper.input_size[0])
+            bgr_fake = _skip_st['bgr_fake']
+        else:
+            if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
+                with modules.globals.dml_lock:
+                    bgr_fake, M = face_swapper.get(
+                        temp_frame, target_face, source_face, paste_back=False
+                    )
+            else:
                 bgr_fake, M = face_swapper.get(
                     temp_frame, target_face, source_face, paste_back=False
                 )
-        else:
-            bgr_fake, M = face_swapper.get(
-                temp_frame, target_face, source_face, paste_back=False
-            )
+            _skip_st['bgr_fake'] = bgr_fake
+            _skip_st['src_id'] = src_id
+            _skip_st['neural_count'] += 1
 
         if bgr_fake is None:
             return original_frame

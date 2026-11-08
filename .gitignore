@@ -29,3 +29,11 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+*.exe
+ffmpeg.exe
+ffprobe.exe
+backup_faceswap/
+garments/cache/
+screenshots/
+
+virtualcam/
