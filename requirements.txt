@@ -1,4 +1,4 @@
-﻿albucore==0.0.24
+albucore==0.0.24
 albumentations==2.0.8
 annotated-types==0.8.0
 certifi==2026.10.23
@@ -40,7 +40,7 @@ onnxruntime-gpu==1.21.1
 opencv-python==4.11.0.86
 opencv-python-headless==4.11.0.86
 packaging==26.3
-pillow==12.3.0
+pillow==13.0.0
 prettytable==3.18.0
 protobuf==7.36.2
 psutil==7.2.2
