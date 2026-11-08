@@ -35,5 +35,6 @@ ffprobe.exe
 backup_faceswap/
 garments/cache/
 screenshots/
+push_to_github.ps1
 
 virtualcam/
