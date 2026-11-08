@@ -1,4 +1,4 @@
-﻿albucore==0.0.24
+albucore==0.0.24
 albumentations==2.0.8
 annotated-types==0.8.0
 certifi==2026.10.23
@@ -59,7 +59,7 @@ pyvirtualcam==0.15.0
 PyYAML==6.0.3
 requests==2.34.2
 scikit-image==0.25.2
-scikit-learn==1.7.2
+scikit-learn==1.9.1
 scipy==1.15.3
 shiboken6==6.12.0
 simsimd==6.5.16
